@@ -23,6 +23,7 @@ def synthetic_shape_dataset_dir(tmp_path_factory: pytest.TempPathFactory) -> Gen
     Yields:
         Path to the synthetic dataset directory.
     """
+    
     seed_all()
     dataset_dir = tmp_path_factory.mktemp("synthetic_dataset")
     generate_coco_dataset(
