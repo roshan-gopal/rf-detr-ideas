@@ -68,10 +68,10 @@ onnx = [
     "polygraphy",
 ]
 trt = [
-    "pycuda",
-    "onnxruntime-gpu",
-    "tensorrt>=8.6.1",
-    "polygraphy",
+    "pycuda; sys_platform == 'linux'",
+    "onnxruntime-gpu; sys_platform == 'linux'",
+    "tensorrt>=8.6.1; sys_platform == 'linux'",
+    "polygraphy; sys_platform == 'linux'",
 ]
 loggers = [
     "tensorboard>=2.13.0",
@@ -178,3 +178,15 @@ filterwarnings = [
 
 [tool.codespell]
 skip = "*.pth"
+
+# TensorRT wheels are only available on Linux x86_64 / aarch64 with NVIDIA drivers.
+# These constraints prevent uv from attempting to resolve them on macOS during
+# lockfile generation, which would otherwise fail even without --extra trt.
+[tool.uv]
+constraint-dependencies = [
+    "tensorrt; sys_platform == 'linux'",
+    "tensorrt-cu13; sys_platform == 'linux'",
+    "tensorrt-cu13-libs; sys_platform == 'linux'",
+    "pycuda; sys_platform == 'linux'",
+    "onnxruntime-gpu; sys_platform == 'linux'",
+]

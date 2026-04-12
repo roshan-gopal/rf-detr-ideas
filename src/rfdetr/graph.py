@@ -3,12 +3,14 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-"""3-body relational graph builder and GNN for pick-and-roll detection.
+"""3-body relational graph builder for pick-and-roll analytics.
 
 Each frame is represented as a directed complete graph over three players:
 
 * **Node 0 — Ball-handler (BH):** player closest to the ball detection,
-  or fastest player when no ball is detected.
+  or the player who **last** had the ball (same ByteTrack ID), falling back
+  to the player nearest that last known position if the ID is missing; only
+  on a cold start (no prior ball-handler) is the fastest player used.
 * **Node 1 — Screener (S):** slowest player within ``screen_radius`` pixels
   of the ball-handler. This heuristic fires on the player most likely to be
   planting to set a screen.
@@ -35,30 +37,33 @@ screener is planted while the ball-handler is in motion.
 Example::
 
     from rfdetr.tracking import PlayerTracker
-    from rfdetr.graph import PickAndRollGraphBuilder, PickAndRollGNN
+    from rfdetr.graph import PickAndRollGraphBuilder, flatten_graph_frame
 
     tracker = PlayerTracker(fps=30.0)
     builder = PickAndRollGraphBuilder(image_width=1280, image_height=720)
-    gnn = PickAndRollGNN(hidden_dim=64, out_dim=32)
 
     for frame in video_frames:
         detections = model.predict(frame, threshold=0.5)
         tracked = tracker.update(detections)
         graph = builder.build(tracked)
-        if graph.valid:
-            embedding = gnn(graph)  # shape: (32,)
+        features_63 = flatten_graph_frame(graph)  # zeros if ``not graph.valid``
 """
 
 from __future__ import annotations
 
-__all__ = ["NODE_DIM", "EDGE_DIM", "GraphFrame", "PickAndRollGraphBuilder", "PickAndRollGNN"]
+__all__ = [
+    "NODE_DIM",
+    "EDGE_DIM",
+    "GRAPH_FEATURE_DIM",
+    "GraphFrame",
+    "PickAndRollGraphBuilder",
+    "flatten_graph_frame",
+]
 
 from dataclasses import dataclass
 
 import numpy as np
 import supervision as sv
-import torch
-import torch.nn as nn
 
 # Number of features per node and per directed edge — exposed so downstream
 # modules can derive their input dimensions without hard-coding magic numbers.
@@ -66,6 +71,8 @@ NODE_DIM: int = 7
 EDGE_DIM: int = 7
 _NUM_NODES: int = 3
 _NUM_EDGES: int = 6  # complete directed graph: 3 nodes × 2 directions
+# Flattened ``GraphFrame``: ``3 * NODE_DIM + 6 * EDGE_DIM`` (node rows + edge rows).
+GRAPH_FEATURE_DIM: int = _NUM_NODES * NODE_DIM + _NUM_EDGES * EDGE_DIM
 # Edge order is fixed: (BH→S, S→BH, BH→D, D→BH, S→D, D→S)
 _EDGE_PAIRS: list[tuple[int, int]] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)]
 
@@ -87,6 +94,24 @@ class GraphFrame:
     node_features: np.ndarray
     edge_features: np.ndarray
     valid: bool
+
+
+def flatten_graph_frame(graph: GraphFrame) -> np.ndarray:
+    """Concatenate node and edge features into one float32 vector of length ``GRAPH_FEATURE_DIM``.
+
+    Invalid frames return a zero vector so sequence models can use padding masks.
+
+    Args:
+        graph: One frame from :meth:`PickAndRollGraphBuilder.build`.
+
+    Returns:
+        Array of shape ``(GRAPH_FEATURE_DIM,)``, dtype ``float32``.
+    """
+    if not graph.valid:
+        return np.zeros((GRAPH_FEATURE_DIM,), dtype=np.float32)
+    return np.concatenate(
+        [graph.node_features.reshape(-1), graph.edge_features.reshape(-1)]
+    ).astype(np.float32, copy=False)
 
 
 class PickAndRollGraphBuilder:
@@ -119,6 +144,29 @@ class PickAndRollGraphBuilder:
         self.ball_class_id = ball_class_id
         self.screen_radius = screen_radius
         self.max_speed = max_speed
+        self._last_bh_tracker_id: int | None = None
+        self._last_bh_centre: np.ndarray | None = None
+
+    def reset(self) -> None:
+        """Clear ball-handler memory when switching to a new clip or game."""
+        self._last_bh_tracker_id = None
+        self._last_bh_centre = None
+
+    def _ball_handler_idx_without_ball(
+        self,
+        *,
+        centres: np.ndarray,
+        p_speed: np.ndarray,
+        tid_player: np.ndarray | None,
+    ) -> int:
+        """Pick ball-handler among players when no ball box is present."""
+        if self._last_bh_tracker_id is not None and tid_player is not None:
+            matches = np.nonzero(tid_player == self._last_bh_tracker_id)[0]
+            if len(matches) > 0:
+                return int(matches[0])
+        if self._last_bh_centre is not None:
+            return int(np.argmin(np.linalg.norm(centres - self._last_bh_centre, axis=1)))
+        return int(np.argmax(p_speed))
 
     def build(self, tracked: sv.Detections) -> GraphFrame:
         """Build a ``GraphFrame`` from one frame of tracked detections.
@@ -160,8 +208,11 @@ class PickAndRollGraphBuilder:
         n = len(cx)
 
         # ── Role assignment ───────────────────────────────────────────────
-        # Ball-handler: nearest player to ball, or fastest if no ball detected.
-        ball_mask = is_ball & (tracked.xyxy is not None)
+        # Ball-handler: nearest player to ball; if no ball, last ball-handler
+        # track ID, else nearest to last BH centre, else fastest (cold start).
+        tid_full = tracked.tracker_id
+        tid_player: np.ndarray | None = tid_full[is_player] if tid_full is not None else None
+
         ball_xyxy = tracked.xyxy[is_ball]
         if len(ball_xyxy) > 0:
             ball_c = np.array(
@@ -169,7 +220,15 @@ class PickAndRollGraphBuilder:
             )
             bh_idx = int(np.argmin(np.linalg.norm(centres - ball_c, axis=1)))
         else:
-            bh_idx = int(np.argmax(p_speed))
+            bh_idx = self._ball_handler_idx_without_ball(
+                centres=centres,
+                p_speed=p_speed,
+                tid_player=tid_player,
+            )
+
+        if tid_player is not None:
+            self._last_bh_tracker_id = int(tid_player[bh_idx])
+        self._last_bh_centre = centres[bh_idx].astype(np.float64, copy=True)
 
         # Screener: slowest player within screen_radius of ball-handler.
         dist_from_bh = np.linalg.norm(centres - centres[bh_idx], axis=1)
@@ -221,46 +280,3 @@ class PickAndRollGraphBuilder:
             edge_feats[e] = [dx, dy, dvx, dvy, dist, approach_rate, speed_ratio]
 
         return GraphFrame(node_features=node_feats, edge_features=edge_feats, valid=True)
-
-
-class PickAndRollGNN(nn.Module):
-    """MLP over flattened node and edge features producing a per-frame embedding.
-
-    Input size is ``NUM_NODES * NODE_DIM + NUM_EDGES * EDGE_DIM = 3×7 + 6×7 = 63``.
-    The fixed node ordering ``[ball-handler, screener, defender]`` lets the MLP
-    learn role-specific patterns directly from position in the feature vector.
-
-    Args:
-        hidden_dim: Width of the two hidden layers.
-        out_dim: Output embedding dimension passed to the temporal encoder.
-    """
-
-    def __init__(self, hidden_dim: int = 64, out_dim: int = 32) -> None:
-        super().__init__()
-        in_dim = _NUM_NODES * NODE_DIM + _NUM_EDGES * EDGE_DIM  # 63
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, graph: GraphFrame) -> torch.Tensor:
-        """Process a single-frame graph into a fixed-size embedding.
-
-        Args:
-            graph: A ``GraphFrame`` with ``valid=True``.  Passing an invalid
-                frame returns a zero embedding without raising an error.
-
-        Returns:
-            Embedding tensor of shape ``(out_dim,)``.
-        """
-        if not graph.valid:
-            out_dim = self.net[-1].out_features
-            return torch.zeros(out_dim)
-
-        node_t = torch.from_numpy(graph.node_features).flatten()   # (21,)
-        edge_t = torch.from_numpy(graph.edge_features).flatten()   # (42,)
-        x = torch.cat([node_t, edge_t])                            # (63,)
-        return self.net(x)

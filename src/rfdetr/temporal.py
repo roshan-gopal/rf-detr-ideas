@@ -3,29 +3,39 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-"""Temporal attention over per-frame graph embeddings (pick-and-roll clip model).
+"""Temporal model over per-frame graph feature vectors (pick-and-roll detection).
 
-Stacks outputs of :class:`~rfdetr.graph.PickAndRollGNN` into a sequence ``(B, T, D)``
-and runs a :class:`torch.nn.TransformerEncoder` with sinusoidal positional
-encoding.  Pooling produces a clip-level vector for classification or downstream
-heads.
+Flattens each :class:`~rfdetr.graph.GraphFrame` to length
+:data:`~rfdetr.graph.GRAPH_FEATURE_DIM` (63) via :func:`~rfdetr.graph.flatten_graph_frame`,
+stacks a clip as ``(B, T, D)``, and runs a :class:`torch.nn.TransformerEncoder`
+with sinusoidal positional encoding.
 
-Example::
+**Frame-level mode** (default): the classifier returns one logit **per frame**
+``(B, T)`` — the model predicts whether a pick-and-roll is occurring at each
+individual timestep, using full temporal context from attention across all frames.
+Use a padding mask to exclude invalid frames from the loss.
 
-    from rfdetr.graph import GraphFrame, PickAndRollGNN
+**Clip-level mode** (``frame_level=False``): pooled mean over time → one logit
+per clip ``(B,)``.  Kept for backwards compatibility and multi-clip baselines.
+
+Example (frame-level)::
+
+    from rfdetr.graph import GraphFrame, GRAPH_FEATURE_DIM
     from rfdetr.temporal import (
         PickAndRollTemporalClassifier,
-        PickAndRollTemporalEncoder,
         encode_graph_sequence,
     )
 
-    gnn = PickAndRollGNN(out_dim=32)
-    temporal = PickAndRollTemporalEncoder(embed_dim=32)
-    classifier = PickAndRollTemporalClassifier(embed_dim=32)  # encoder + linear
+    classifier = PickAndRollTemporalClassifier(
+        embed_dim=GRAPH_FEATURE_DIM,
+        num_heads=3,
+        frame_level=True,   # default
+    )
 
     # ``graphs`` is a list of ``GraphFrame`` for one clip (length T).
-    x, padding_mask = encode_graph_sequence(gnn, graphs)
-    logit = classifier(x, src_key_padding_mask=padding_mask)  # shape (1,)
+    x, padding_mask = encode_graph_sequence(graphs)
+    logits = classifier(x, src_key_padding_mask=padding_mask)  # shape (1, T)
+    # loss: BCEWithLogitsLoss on logits[~padding_mask] vs per-frame labels
 """
 
 from __future__ import annotations
@@ -42,7 +52,7 @@ import math
 import torch
 import torch.nn as nn
 
-from rfdetr.graph import GraphFrame, PickAndRollGNN
+from rfdetr.graph import GRAPH_FEATURE_DIM, GraphFrame, flatten_graph_frame
 
 
 class SinusoidalPositionEncoding(nn.Module):
@@ -57,8 +67,12 @@ class SinusoidalPositionEncoding(nn.Module):
         div_term = torch.exp(
             torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
         )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        # Odd d_model: even-indexed columns are one more than odd-indexed; split div_term for cos.
+        pe[:, 0::2] = torch.sin(position * div_term.unsqueeze(0))
+        if d_model % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1].unsqueeze(0))
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term.unsqueeze(0))
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,15 +94,15 @@ class SinusoidalPositionEncoding(nn.Module):
 
 
 class PickAndRollTemporalEncoder(nn.Module):
-    """Transformer encoder over time on graph embeddings.
+    """Transformer encoder over time on flattened graph features.
 
-    Expects input shape ``(B, T, embed_dim)`` — one token per frame.  When
-    ``src_key_padding_mask`` is provided (``True`` = ignore position), pooling
-    uses a masked mean over valid timesteps only.
+    Expects input shape ``(B, T, embed_dim)`` — one token per frame (default
+    ``embed_dim=GRAPH_FEATURE_DIM``).
 
     Args:
-        embed_dim: Channel size (must match :class:`~rfdetr.graph.PickAndRollGNN`
-            ``out_dim``).  Must be divisible by ``num_heads``.
+        embed_dim: Per-frame channel size (default 63 = flattened graph).  Must
+            be divisible by ``num_heads`` (e.g. ``num_heads=3`` when
+            ``embed_dim=63``).
         num_heads: Attention heads.
         num_layers: Stacked :class:`torch.nn.TransformerEncoderLayer` count.
         dim_feedforward: FFN hidden size inside each layer.
@@ -99,8 +113,8 @@ class PickAndRollTemporalEncoder(nn.Module):
 
     def __init__(
         self,
-        embed_dim: int = 32,
-        num_heads: int = 4,
+        embed_dim: int = GRAPH_FEATURE_DIM,
+        num_heads: int = 3,
         num_layers: int = 2,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
@@ -132,89 +146,104 @@ class PickAndRollTemporalEncoder(nn.Module):
         x: torch.Tensor,
         src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode a batch of embedding sequences.
+        """Run transformer over sequence, returning full ``(B, T, embed_dim)`` output.
 
         Args:
             x: Float tensor ``(B, T, embed_dim)``.
             src_key_padding_mask: Optional bool tensor ``(B, T)``.  ``True``
-                marks positions to **ignore** (PyTorch convention, same as
-                :class:`torch.nn.TransformerEncoder`).
+                marks positions to **ignore** (PyTorch convention).
 
         Returns:
-            Clip embedding of shape ``(B, embed_dim)``.
+            Tensor of shape ``(B, T, embed_dim)`` — each frame is contextualized
+            by all other frames in the clip via self-attention.
         """
         if x.dim() != 3:
             raise ValueError(f"expected x shape (B, T, D), got {tuple(x.shape)}")
         h = self.pos_encoding(x)
-        h = self.transformer(h, src_key_padding_mask=src_key_padding_mask)
-        if src_key_padding_mask is not None:
-            mask = (~src_key_padding_mask).to(dtype=h.dtype).unsqueeze(-1)
-            summed = (h * mask).sum(dim=1)
-            denom = mask.sum(dim=1).clamp(min=1e-6)
-            return summed / denom
-        return h.mean(dim=1)
+        return self.transformer(h, src_key_padding_mask=src_key_padding_mask)
 
 
 class PickAndRollTemporalClassifier(nn.Module):
-    """Temporal encoder followed by a single linear layer (binary logit)."""
+    """Transformer encoder followed by a per-frame (or clip-level) linear head.
+
+    Args:
+        encoder: Optional pre-built :class:`PickAndRollTemporalEncoder`.  If
+            omitted, one is constructed from ``**encoder_kwargs``.
+        frame_level: If ``True`` (default), output shape is ``(B, T)`` — one
+            logit per frame.  If ``False``, mean-pool over valid timesteps and
+            return ``(B,)`` — one logit per clip.
+        **encoder_kwargs: Forwarded to :class:`PickAndRollTemporalEncoder` when
+            ``encoder`` is ``None``.
+    """
 
     def __init__(
         self,
         encoder: PickAndRollTemporalEncoder | None = None,
+        frame_level: bool = True,
         **encoder_kwargs,
     ) -> None:
         super().__init__()
         self.encoder = encoder if encoder is not None else PickAndRollTemporalEncoder(**encoder_kwargs)
         self.head = nn.Linear(self.encoder.embed_dim, 1)
+        self.frame_level = frame_level
 
     def forward(
         self,
         x: torch.Tensor,
         src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return per-batch logits for "pick-and-roll clip".
+        """Return logits for pick-and-roll prediction.
 
         Args:
             x: ``(B, T, embed_dim)``.
-            src_key_padding_mask: Optional ``(B, T)`` padding mask.
+            src_key_padding_mask: Optional ``(B, T)`` bool mask; ``True``
+                marks frames to ignore.
 
         Returns:
-            Logits of shape ``(B,)`` (squeeze last dim of linear output).
+            ``(B, T)`` per-frame logits when ``frame_level=True``, or ``(B,)``
+            clip logits when ``frame_level=False``.
         """
-        z = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
-        return self.head(z).squeeze(-1)
+        h = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # (B, T, D)
+        logits = self.head(h).squeeze(-1)                                # (B, T)
+        if self.frame_level:
+            return logits
+        # Clip-level: masked mean pool then scalar
+        if src_key_padding_mask is not None:
+            valid = (~src_key_padding_mask).to(dtype=h.dtype)            # (B, T)
+            summed = (logits * valid).sum(dim=1)
+            denom = valid.sum(dim=1).clamp(min=1e-6)
+            return summed / denom
+        return logits.mean(dim=1)
 
 
 def encode_graph_sequence(
-    gnn: PickAndRollGNN,
     graphs: list[GraphFrame],
+    *,
+    device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stack ``GraphFrame`` list into one batch item ``(1, T, D)`` with padding mask.
+    """Stack ``GraphFrame`` list into one batch item ``(1, T, GRAPH_FEATURE_DIM)``.
 
-    Invalid graphs still produce a zero vector from ``gnn`` but are marked as
-    padding so the temporal encoder can exclude them from masked pooling and
-    (if desired) from attention via ``src_key_padding_mask``.
+    Invalid graphs produce a zero vector (see :func:`~rfdetr.graph.flatten_graph_frame`)
+    and are marked in ``src_key_padding_mask`` so pooling and attention can skip them.
 
     Args:
-        gnn: Per-frame graph MLP.
         graphs: Ordered frames for one clip.
+        device: Tensor device (default: CPU).
 
     Returns:
-        ``(x, src_key_padding_mask)`` where ``x`` is ``(1, T, out_dim)`` and
-        ``src_key_padding_mask`` is ``(1, T)`` bool, ``True`` where the frame
-        should be ignored (invalid graph).
+        ``(x, src_key_padding_mask)`` where ``x`` is ``(1, T, GRAPH_FEATURE_DIM)``
+        and ``src_key_padding_mask`` is ``(1, T)`` bool, ``True`` where the
+        frame should be ignored (invalid graph).
     """
     if len(graphs) == 0:
         raise ValueError("graphs must be non-empty")
-    device = next(gnn.parameters()).device
+    dev = device or torch.device("cpu")
     rows: list[torch.Tensor] = []
     ignore: list[bool] = []
     for g in graphs:
-        e = gnn(g)
-        if e.device != device:
-            e = e.to(device)
-        rows.append(e)
+        vec = flatten_graph_frame(g)
+        rows.append(torch.from_numpy(vec).to(dev))
         ignore.append(not g.valid)
     x = torch.stack(rows, dim=0).unsqueeze(0)
-    src_key_padding_mask = torch.tensor([ignore], dtype=torch.bool, device=device)
+    src_key_padding_mask = torch.tensor([ignore], dtype=torch.bool, device=dev)
     return x, src_key_padding_mask
