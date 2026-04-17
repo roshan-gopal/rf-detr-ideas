@@ -338,7 +338,27 @@ def main() -> None:
     ).to(device)
     model.train()
 
-    criterion = nn.BCEWithLogitsLoss(reduction="sum")
+    # Weight positives higher to reduce "always negative" collapse.
+    # pos_weight ~= N_neg / N_pos over labeled training frames.
+    n_pos = 0
+    n_neg = 0
+    for cid, frames in labeled_clips:
+        for fidx, _gf, _valid in frames:
+            key = (cid, fidx)
+            if key not in frame_labels:
+                continue
+            if frame_labels[key] >= 0.5:
+                n_pos += 1
+            else:
+                n_neg += 1
+    if n_pos == 0:
+        pos_weight_value = 1.0
+        print("Warning: no positive labeled frames found; using pos_weight=1.0", file=sys.stderr)
+    else:
+        pos_weight_value = max(1.0, n_neg / n_pos)
+    pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(reduction="sum", pos_weight=pos_weight)
+    print(f"Using BCEWithLogitsLoss pos_weight={pos_weight_value:.4f} (n_pos={n_pos}, n_neg={n_neg})")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     total_params = sum(p.numel() for p in model.parameters())
