@@ -36,7 +36,8 @@ Example (real labels, 5 epochs)::
         --graphs raw_data/graph_train.jsonl \\
         --labels raw_data/labels.csv \\
         --norm-stats raw_data/graph_feature_norm.json \\
-        --epochs 5
+        --epochs 5 \\
+        --save-model raw_data/pick_roll_model.pt
 
 Structured logs (for plotting or analysis)::
 
@@ -267,6 +268,13 @@ def main() -> None:
         default=None,
         metavar="PATH",
         help="CSV log for spreadsheets / pandas (same events as JSONL; empty cells where N/A).",
+    )
+    parser.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Optional path to save final model checkpoint (.pt).",
     )
     args = parser.parse_args()
 
@@ -515,6 +523,22 @@ def main() -> None:
             log_jsonl_fp.close()
         if log_csv_fp is not None:
             log_csv_fp.close()
+
+    if args.save_model is not None:
+        args.save_model.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "embed_dim": GRAPH_FEATURE_DIM,
+            "num_heads": 3,
+            "num_layers": 2,
+            "dim_feedforward": 128,
+            "dropout": 0.1,
+            "frame_level": True,
+            "norm_stats_path": str(args.norm_stats) if args.norm_stats is not None else None,
+            "epochs": args.epochs,
+        }
+        torch.save(checkpoint, args.save_model)
+        print(f"Saved model checkpoint to {args.save_model}")
 
     print("\nDone. Loss should decrease across epochs if training is working.")
     if args.smoke_test:
