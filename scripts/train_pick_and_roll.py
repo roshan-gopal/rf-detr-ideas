@@ -20,6 +20,10 @@ contribute a gradient.  This lets you label only the frames you are confident
 about (e.g. the exact window where the screen is set) without needing to label
 every single frame.
 
+The training objective also includes a small temporal smoothness (total
+variation) term on neighboring probabilities to encourage contiguous positive
+segments and reduce one-frame prediction jitter.
+
 Smoke-test mode (``--smoke-test``) skips the labels file and assigns label=1 to
 the middle third of every clip — useful to verify shapes, gradients, and the
 masked-loss logic without real labels.
@@ -72,6 +76,8 @@ import torch.nn as nn
 from rfdetr.graph import GRAPH_FEATURE_DIM
 from rfdetr.graph_normalization import GraphFeatureNormalization, standardize
 from rfdetr.temporal import PickAndRollTemporalClassifier, PickAndRollTemporalEncoder
+
+SEGMENT_TV_WEIGHT = 0.05
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -359,6 +365,7 @@ def main() -> None:
     pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(reduction="sum", pos_weight=pos_weight)
     print(f"Using BCEWithLogitsLoss pos_weight={pos_weight_value:.4f} (n_pos={n_pos}, n_neg={n_neg})")
+    print(f"Using TV smoothness weight={SEGMENT_TV_WEIGHT:.4f}")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -441,7 +448,15 @@ def main() -> None:
                 if n_active == 0:
                     continue
 
-                loss = criterion(logits[active], targets[active]) / n_active
+                loss_bce = criterion(logits[active], targets[active]) / n_active
+                probs_full = torch.sigmoid(logits)                      # (1, T)
+                pair_active = active[:, :-1] & active[:, 1:]           # (1, T-1)
+                if pair_active.any():
+                    tv_deltas = torch.abs(probs_full[:, 1:] - probs_full[:, :-1])
+                    loss_tv = tv_deltas[pair_active].mean()
+                else:
+                    loss_tv = torch.zeros((), dtype=logits.dtype, device=device)
+                loss = loss_bce + (SEGMENT_TV_WEIGHT * loss_tv)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -450,7 +465,7 @@ def main() -> None:
                 epoch_loss += loss.item() * n_active
                 epoch_labeled_frames += int(n_active)
 
-                probs = torch.sigmoid(logits[0])                       # (T,)
+                probs = probs_full[0]                                  # (T,)
                 labeled_frame_indices = [
                     (fi, int(label_mask[0, t].item()), float(probs[t].item()), float(targets[0, t].item()))
                     for t, (fi, _gf, _valid) in enumerate(frames)
@@ -462,7 +477,8 @@ def main() -> None:
                 )
                 print(
                     f"  epoch={epoch} clip={cid!r} n_labeled={int(n_active)} "
-                    f"loss={loss.item():.4f} [{prob_summary}]"
+                    f"loss={loss.item():.4f} bce={loss_bce.item():.4f} tv={loss_tv.item():.4f} "
+                    f"[{prob_summary}]"
                 )
 
                 if log_jsonl_fp is not None:
