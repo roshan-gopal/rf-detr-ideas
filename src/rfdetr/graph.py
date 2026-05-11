@@ -17,22 +17,41 @@ Each frame is represented as a directed complete graph over three players:
 * **Node 2 — Nearest defender (D):** player closest to the ball-handler
   who is neither the ball-handler nor the screener.
 
-Node features (``NODE_DIM = 7``)::
+Node features (``NODE_DIM = 11``)::
 
-    [cx_norm, cy_norm, vx_norm, vy_norm, speed_norm, w_norm, h_norm]
+    [cx_norm, cy_norm, vx_norm, vy_norm, speed_norm, w_norm, h_norm,
+     bh_rel_x, bh_rel_y, heading_x, heading_y]
 
-Edge features (``EDGE_DIM = 7``, one row per directed edge A→B)::
+Where:
 
-    [dx_norm, dy_norm, dvx_norm, dvy_norm, dist_norm, approach_rate, speed_ratio]
+* ``bh_rel_x / bh_rel_y`` — position relative to the ball-handler
+  (zero for the BH node itself); removes absolute court-zone bias.
+* ``heading_x / heading_y`` — unit velocity direction ``v / (|v| + ε)``;
+  captures movement direction independent of speed magnitude so that a
+  play running left vs right produces the same directional pattern.
 
-Where ``approach_rate = dot(v_A_norm, unit(A→B))`` captures whether A is
-actively moving *toward* B (positive) or away (negative) — the key signal
-for distinguishing a player running past another from one approaching to use
-a screen.
+Edge features (``EDGE_DIM = 9``, one row per directed edge A→B)::
 
-``speed_ratio = speed_A / (speed_B + ε)`` captures whether one player is
-stationary relative to the other — a high ratio on the S→BH edge means the
-screener is planted while the ball-handler is in motion.
+    [dx_norm, dy_norm, dvx_norm, dvy_norm, dist_norm, approach_rate,
+     speed_ratio, blocker_score, screen_angle_cos]
+
+Where:
+
+* ``approach_rate = dot(v_A_norm, unit(A→B))`` captures whether A is
+  actively moving *toward* B (positive) or away (negative) — the key signal
+  for distinguishing a player running past another from one approaching to use
+  a screen.
+* ``speed_ratio = speed_A / (speed_B + ε)`` captures whether one player is
+  stationary relative to the other — a high ratio on the S→BH edge means the
+  screener is planted while the ball-handler is in motion.
+* ``blocker_score`` — how squarely the screener is positioned on the BH→D
+  line; ``1 - clip(perp_dist(S, BH→D) / |BH→D|, 0, 1)``.  Value near 1
+  means S is directly in the defender's path (textbook screen).  Identical
+  for all six edges since it is a frame-level scalar.
+* ``screen_angle_cos`` — cosine of the angle between the BH→S direction and
+  BH's own velocity heading.  Near 1 means the ball-handler is running
+  directly toward the screen; near −1 means running away.  Identical for all
+  six edges.
 
 Example::
 
@@ -67,8 +86,8 @@ import supervision as sv
 
 # Number of features per node and per directed edge — exposed so downstream
 # modules can derive their input dimensions without hard-coding magic numbers.
-NODE_DIM: int = 7
-EDGE_DIM: int = 7
+NODE_DIM: int = 11
+EDGE_DIM: int = 9
 _NUM_NODES: int = 3
 _NUM_EDGES: int = 6  # complete directed graph: 3 nodes × 2 directions
 # Flattened ``GraphFrame``: ``3 * NODE_DIM + 6 * EDGE_DIM`` (node rows + edge rows).
@@ -246,17 +265,46 @@ class PickAndRollGraphBuilder:
 
         roles = [bh_idx, screener_idx, defender_idx]
 
+        # ── Frame-level geometric features (shared across all edges) ──────
+        bh_c = centres[bh_idx]
+        s_c = centres[screener_idx]
+        d_c = centres[defender_idx]
+
+        # Blocker score: how squarely S lies on the BH→D line.
+        # perp_dist = |cross(BH→D, BH→S)| / |BH→D|; normalise by |BH→D|.
+        bd = d_c - bh_c
+        bs = s_c - bh_c
+        bd_len = float(np.linalg.norm(bd))
+        cross = abs(float(bd[0] * bs[1] - bd[1] * bs[0]))
+        perp_dist = cross / (bd_len + 1e-6)
+        blocker_score = float(np.clip(1.0 - perp_dist / (bd_len + 1e-6), 0.0, 1.0))
+
+        # Screen angle cos: cosine of angle between BH velocity and BH→S direction.
+        bs_len = float(np.linalg.norm(bs))
+        bs_unit = bs / (bs_len + 1e-6)
+        bh_heading = p_vel[bh_idx] / (float(p_speed[bh_idx]) + 1e-6)
+        screen_angle_cos = float(np.clip(np.dot(bh_heading, bs_unit), -1.0, 1.0))
+
         # ── Node features ─────────────────────────────────────────────────
+        bh_cx = cx[bh_idx]
+        bh_cy = cy[bh_idx]
         node_feats = np.zeros((_NUM_NODES, NODE_DIM), dtype=np.float32)
         for i, r in enumerate(roles):
+            spd = float(p_speed[r])
             node_feats[i] = [
                 cx[r] / self.W,
                 cy[r] / self.H,
                 np.clip(p_vel[r, 0] / self.max_speed, -1.0, 1.0),
                 np.clip(p_vel[r, 1] / self.max_speed, -1.0, 1.0),
-                np.clip(p_speed[r] / self.max_speed, 0.0, 1.0),
+                np.clip(spd / self.max_speed, 0.0, 1.0),
                 w[r] / self.W,
                 h[r] / self.H,
+                # New: BH-relative position (0,0 for BH node itself)
+                (cx[r] - bh_cx) / self.W,
+                (cy[r] - bh_cy) / self.H,
+                # New: unit velocity heading (direction independent of speed)
+                float(np.clip(p_vel[r, 0] / (spd + 1e-6), -1.0, 1.0)),
+                float(np.clip(p_vel[r, 1] / (spd + 1e-6), -1.0, 1.0)),
             ]
 
         # ── Edge features ─────────────────────────────────────────────────
@@ -277,6 +325,8 @@ class PickAndRollGraphBuilder:
             # Speed ratio: >1 means A is faster than B (screener planted if <1 on S→BH edge).
             speed_ratio = float(np.clip(p_speed[ra] / (p_speed[rb] + 1e-6), 0.0, 10.0) / 10.0)
 
-            edge_feats[e] = [dx, dy, dvx, dvy, dist, approach_rate, speed_ratio]
+            # New: frame-level scalars appended to every edge.
+            edge_feats[e] = [dx, dy, dvx, dvy, dist, approach_rate, speed_ratio,
+                             blocker_score, screen_angle_cos]
 
         return GraphFrame(node_features=node_feats, edge_features=edge_feats, valid=True)

@@ -77,7 +77,7 @@ from rfdetr.graph import GRAPH_FEATURE_DIM
 from rfdetr.graph_normalization import GraphFeatureNormalization, standardize
 from rfdetr.temporal import PickAndRollTemporalClassifier, PickAndRollTemporalEncoder
 
-SEGMENT_TV_WEIGHT = 0.05
+SEGMENT_TV_WEIGHT = 0
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
