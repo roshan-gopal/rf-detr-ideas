@@ -6,7 +6,7 @@
 """Temporal model over per-frame graph feature vectors (pick-and-roll detection).
 
 Flattens each :class:`~rfdetr.graph.GraphFrame` to length
-:data:`~rfdetr.graph.GRAPH_FEATURE_DIM` (63) via :func:`~rfdetr.graph.flatten_graph_frame`,
+:data:`~rfdetr.graph.GRAPH_FEATURE_DIM` via :func:`~rfdetr.graph.flatten_graph_frame`,
 stacks a clip as ``(B, T, D)``, and runs a :class:`torch.nn.TransformerEncoder`
 with sinusoidal positional encoding.
 
@@ -100,9 +100,9 @@ class PickAndRollTemporalEncoder(nn.Module):
     ``embed_dim=GRAPH_FEATURE_DIM``).
 
     Args:
-        embed_dim: Per-frame channel size (default 63 = flattened graph).  Must
-            be divisible by ``num_heads`` (e.g. ``num_heads=3`` when
-            ``embed_dim=63``).
+        embed_dim: Per-frame channel size (default ``GRAPH_FEATURE_DIM`` =
+            flattened graph). Must be divisible by ``num_heads`` (e.g.
+            ``num_heads=3`` when ``embed_dim`` matches the flattened dim).
         num_heads: Attention heads.
         num_layers: Stacked :class:`torch.nn.TransformerEncoderLayer` count.
         dim_feedforward: FFN hidden size inside each layer.

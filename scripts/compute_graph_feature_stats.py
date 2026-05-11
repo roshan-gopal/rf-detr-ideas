@@ -5,6 +5,11 @@
 # ------------------------------------------------------------------------
 """Compute mean/std for ``graph_features`` from a saved-graph JSONL (training set).
 
+Vector length must match :data:`rfdetr.graph.GRAPH_FEATURE_DIM` (defined in
+``rfdetr.graph`` from the current flattened graph layout — not a fixed magic
+number). Re-run this script after changing node/edge features so ``mean`` /
+``std`` match your exported JSONL.
+
 Example::
 
     PYTHONPATH=src python scripts/compute_graph_feature_stats.py \\

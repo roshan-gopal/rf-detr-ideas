@@ -11,10 +11,10 @@ Expects each line to match ``scripts/filter_tactical_jsonl.py`` output:
 ``width``, ``height``.
 
 Use ``--save-graphs PATH`` to write one JSON object per line for training:
-``graph_features`` (63 floats, :func:`rfdetr.graph.flatten_graph_frame`), plus
+``graph_features`` (length ``GRAPH_FEATURE_DIM``, :func:`rfdetr.graph.flatten_graph_frame`), plus
 ``node_features`` / ``edge_features`` / ``graph_valid`` for inspection.
 
-Use ``--show-features N`` to print the 63-D vector for the first ``N`` frames
+Use ``--show-features N`` to print the flattened vector for the first ``N`` frames
 (so you can eyeball the exact training input without opening the file).
 """
 
@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 import supervision as sv
 
-from rfdetr.graph import PickAndRollGraphBuilder, flatten_graph_frame
+from rfdetr.graph import GRAPH_FEATURE_DIM, PickAndRollGraphBuilder, flatten_graph_frame
 from rfdetr.tracking import PlayerTracker
 
 
@@ -56,7 +56,7 @@ def main() -> None:
         type=Path,
         default=None,
         metavar="PATH",
-        help="Write per-frame JSONL with graph_features (63) and tensor breakdown.",
+        help=f"Write per-frame JSONL with graph_features ({GRAPH_FEATURE_DIM}) and tensor breakdown.",
     )
     parser.add_argument(
         "--quiet",
@@ -68,7 +68,7 @@ def main() -> None:
         type=int,
         default=0,
         metavar="N",
-        help="Print graph_features (63 floats) for the first N frames.",
+        help=f"Print graph_features ({GRAPH_FEATURE_DIM} floats) for the first N frames.",
     )
     args = parser.parse_args()
 

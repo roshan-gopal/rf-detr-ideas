@@ -4,15 +4,15 @@
 
 This repository adds an **experimental tactical stack** on top of RF-DETR-style detections: turn **per-frame boxes** (ball + players) into a **fixed-size feature vector** each timestep, then optionally run a **clip-level temporal model** with a **classification head** aimed at **when pick-and-rolls occur** in a short video window.
 
-### Per-frame feature vector (63 dimensions)
+### Per-frame feature vector (`GRAPH_FEATURE_DIM`)
 
-`PickAndRollGraphBuilder` (`src/rfdetr/graph.py`) assigns three **roles** using **heuristics** (not a trained role detector): **ball-handler** (nearest to the ball, or the player who last had the ball via ByteTrack continuity), **screener** (slowest teammate within a radius of the ball-handler), and **nearest defender**. From those roles it builds a small **relational graph**: **7** features per node (position, velocity, speed, box size) and **7** features per **directed** edge (relative geometry and motion cues such as approach rate).
+`PickAndRollGraphBuilder` (`src/rfdetr/graph.py`) assigns three **roles** using **heuristics** (not a trained role detector): **ball-handler** (nearest to the ball, or the player who last had the ball via ByteTrack continuity), **screener** (slowest teammate within a radius of the ball-handler), and **nearest defender**. From those roles it builds a small **relational graph**: **`NODE_DIM`** features per node and **`EDGE_DIM`** per **directed** edge (absolute + relative geometry, motion cues such as approach rate, and extra invariants — see the module docstring).
 
-`flatten_graph_frame` stacks that graph into a single **`float32` vector of length 63** (`GRAPH_FEATURE_DIM`), which is the **input representation** intended for sequence models. Invalid frames (fewer than three players) yield a **zero vector**; use a padding mask when encoding sequences so the model can ignore them.
+`flatten_graph_frame` stacks that graph into a single **`float32` vector of length `GRAPH_FEATURE_DIM`**, which is the **input representation** intended for sequence models. Invalid frames (fewer than three players) yield a **zero vector**; use a padding mask when encoding sequences so the model can ignore them.
 
 ### Clip-level head (temporal transformer + classifier)
 
-`src/rfdetr/temporal.py` provides **`encode_graph_sequence`**, which stacks a list of `GraphFrame` objects into a tensor **`(batch, time, 63)`**, and **`PickAndRollTemporalEncoder`**, a compact **Transformer encoder over time** with masked pooling. **`PickAndRollTemporalClassifier`** adds a **linear head** producing a **single logit per clip** (e.g. binary “pick-and-roll vs not” once you attach labels). That is the **trainable** path for **learning** when pick-and-rolls occur; the 63-D vector is the **hand-crafted geometry/motion signal** fed into that model.
+`src/rfdetr/temporal.py` provides **`encode_graph_sequence`**, which stacks a list of `GraphFrame` objects into a tensor **`(batch, time, GRAPH_FEATURE_DIM)`**, and **`PickAndRollTemporalEncoder`**, a compact **Transformer encoder over time** with masked pooling. **`PickAndRollTemporalClassifier`** adds a **linear head** (frame-level or clip-level logits). That is the **trainable** path for **learning** when pick-and-rolls occur; the flattened graph vector is the **hand-crafted geometry/motion signal** fed into that model.
 
 ### Scripts and data flow
 

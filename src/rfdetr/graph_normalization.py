@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
-"""Per-dimension mean/std normalization for 63-D ``graph_features`` vectors.
+"""Per-dimension mean/std normalization for ``graph_features`` vectors.
 
 Fit **mean** and **standard deviation** on a **training** set of saved exports
 (see ``scripts/run_tactical_graph_from_jsonl.py`` with ``--save-graphs``), save
@@ -104,8 +104,8 @@ def standardize(
     """Return ``(x - mean) / (std + epsilon)`` with broadcasting.
 
     Args:
-        x: Shape ``(..., GRAPH_FEATURE_DIM)`` (e.g. one row ``(63,)`` or batch
-            ``(T, 63)`` or ``(B, T, 63)``).
+        x: Shape ``(..., GRAPH_FEATURE_DIM)`` (e.g. one row ``(D,)`` or batch
+            ``(T, D)`` or ``(B, T, D)`` where ``D`` is ``GRAPH_FEATURE_DIM``).
         mean: Shape ``(GRAPH_FEATURE_DIM,)``.
         std: Shape ``(GRAPH_FEATURE_DIM,)``.
         epsilon: Added to std to avoid division by zero.

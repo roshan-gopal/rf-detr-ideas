@@ -65,7 +65,7 @@ Example::
         detections = model.predict(frame, threshold=0.5)
         tracked = tracker.update(detections)
         graph = builder.build(tracked)
-        features_63 = flatten_graph_frame(graph)  # zeros if ``not graph.valid``
+        graph_vec = flatten_graph_frame(graph)  # zeros if ``not graph.valid``
 """
 
 from __future__ import annotations
