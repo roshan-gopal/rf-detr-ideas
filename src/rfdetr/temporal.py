@@ -12,8 +12,11 @@ with sinusoidal positional encoding.
 
 **Frame-level mode** (default): the classifier returns one logit **per frame**
 ``(B, T)`` — the model predicts whether a pick-and-roll is occurring at each
-individual timestep, using full temporal context from attention across all frames.
-Use a padding mask to exclude invalid frames from the loss.
+individual timestep.  By default the encoder uses **causal** self-attention
+(each frame may attend only to itself and earlier frames), which avoids
+look-ahead when labels are strict per-frame events.  Set ``causal=False`` for
+bidirectional context (full-clip attention).  Use a padding mask to exclude
+invalid frames from the loss.
 
 **Clip-level mode** (``frame_level=False``): pooled mean over time → one logit
 per clip ``(B,)``.  Kept for backwards compatibility and multi-clip baselines.
@@ -53,6 +56,26 @@ import torch
 import torch.nn as nn
 
 from rfdetr.graph import GRAPH_FEATURE_DIM, GraphFrame, flatten_graph_frame
+
+
+def build_causal_attention_mask(seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Additive self-attention mask that blocks attending to future timesteps.
+
+    Args:
+        seq_len: Sequence length ``T``.
+        device: Mask device (match input tensor).
+        dtype: Mask dtype (match input tensor).
+
+    Returns:
+        Tensor of shape ``(T, T)`` with ``0`` on/below the diagonal and
+        ``-inf`` above — suitable for :class:`torch.nn.TransformerEncoder`.
+    """
+    mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
+    future = torch.triu(
+        torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+        diagonal=1,
+    )
+    return mask.masked_fill(future, float("-inf"))
 
 
 class SinusoidalPositionEncoding(nn.Module):
@@ -109,6 +132,9 @@ class PickAndRollTemporalEncoder(nn.Module):
         dropout: Dropout on attention and FFN.
         max_seq_len: Maximum sequence length for positional encoding.
         activation: FFN activation (passed to ``TransformerEncoderLayer``).
+        causal: If ``True`` (default), mask future frames in self-attention so
+            frame ``t`` only uses timesteps ``0..t``.  If ``False``, use
+            bidirectional attention over the clip.
     """
 
     def __init__(
@@ -120,12 +146,14 @@ class PickAndRollTemporalEncoder(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = 256,
         activation: str = "relu",
+        causal: bool = True,
     ) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
 
         self.embed_dim = embed_dim
+        self.causal = causal
         self.pos_encoding = SinusoidalPositionEncoding(
             d_model=embed_dim,
             max_len=max_seq_len,
@@ -154,13 +182,17 @@ class PickAndRollTemporalEncoder(nn.Module):
                 marks positions to **ignore** (PyTorch convention).
 
         Returns:
-            Tensor of shape ``(B, T, embed_dim)`` — each frame is contextualized
-            by all other frames in the clip via self-attention.
+            Tensor of shape ``(B, T, embed_dim)``.  With ``causal=True``, frame
+            ``t`` only aggregates timesteps ``<= t``; otherwise all frames in the
+            clip may attend to each other.
         """
         if x.dim() != 3:
             raise ValueError(f"expected x shape (B, T, D), got {tuple(x.shape)}")
         h = self.pos_encoding(x)
-        return self.transformer(h, src_key_padding_mask=src_key_padding_mask)
+        attn_mask: torch.Tensor | None = None
+        if self.causal:
+            attn_mask = build_causal_attention_mask(h.size(1), h.device, h.dtype)
+        return self.transformer(h, mask=attn_mask, src_key_padding_mask=src_key_padding_mask)
 
 
 class PickAndRollTemporalClassifier(nn.Module):

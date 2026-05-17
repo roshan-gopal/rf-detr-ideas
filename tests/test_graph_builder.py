@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import supervision as sv
 
-from rfdetr.graph import PickAndRollGraphBuilder
+from rfdetr.graph import EDGE_DIM, PickAndRollGraphBuilder
 
 
 def _frame(
@@ -125,3 +125,35 @@ def test_cold_start_no_ball_uses_fastest_player() -> None:
     # Middle player (index 1) has highest speed → BH node x should match that box center.
     cx_mid = (xyxy[1, 0] + xyxy[1, 2]) / 2.0 / 1280.0
     assert pytest.approx(g.node_features[0, 0], rel=1e-5) == cx_mid
+
+
+def test_temporal_delta_speed_screener_positive_when_speed_rises() -> None:
+    """Second valid frame increases screener speed with same tracker → delta_speed_s > 0 on edges."""
+    builder = PickAndRollGraphBuilder(
+        image_width=1280,
+        image_height=720,
+        ball_class_id=0,
+        screen_radius=200.0,
+        max_speed=1000.0,
+    )
+    ball = np.array([[630.0, 350.0, 650.0, 370.0]], dtype=np.float32)
+    p0 = np.array([[610.0, 345.0, 635.0, 375.0]], dtype=np.float32)
+    p1 = np.array([[650.0, 345.0, 680.0, 375.0]], dtype=np.float32)
+    p2 = np.array([[900.0, 400.0, 940.0, 500.0]], dtype=np.float32)
+    xyxy = np.vstack([ball, p0, p1, p2])
+    cid = np.array([0, 3, 3, 3], dtype=np.int32)
+    tid = np.array([0, 7, 8, 9], dtype=np.int32)
+    vel1 = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 10.0], [0.0, 0.0]], dtype=np.float32)
+    spd1 = np.array([50.0, 50.0, 10.0, 11.0], dtype=np.float32)
+    g1 = builder.build(_frame(xyxy, cid, tid, velocity=vel1, speed=spd1))
+    assert g1.valid
+    # First frame: no temporal history → speed deltas 0 on edges.
+    assert g1.edge_features[0, 9] == pytest.approx(0.0, abs=1e-5)
+
+    vel2 = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 60.0], [0.0, 0.0]], dtype=np.float32)
+    spd2 = np.array([50.0, 50.0, 60.0, 65.0], dtype=np.float32)
+    g2 = builder.build(_frame(xyxy, cid, tid, velocity=vel2, speed=spd2))
+    assert g2.valid
+    # Screener stays slowest in near pool (60 < 65); same tracker 8 → delta_speed_s = 50/1000.
+    assert g2.edge_features.shape == (6, EDGE_DIM)
+    assert g2.edge_features[0, 9] == pytest.approx(0.05, rel=1e-4, abs=1e-4)

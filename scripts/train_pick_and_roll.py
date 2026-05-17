@@ -339,10 +339,12 @@ def main() -> None:
             num_layers=2,
             dim_feedforward=128,
             dropout=0.1,
+            causal=True,
         ),
         frame_level=True,
     ).to(device)
     model.train()
+    print("Using causal temporal attention (no future-frame lookahead).")
 
     # Weight positives higher to reduce "always negative" collapse.
     # pos_weight ~= N_neg / N_pos over labeled training frames.
@@ -570,6 +572,7 @@ def main() -> None:
             "dim_feedforward": 128,
             "dropout": 0.1,
             "frame_level": True,
+            "causal": True,
             "norm_stats_path": str(args.norm_stats) if args.norm_stats is not None else None,
             "epochs": args.epochs,
         }

@@ -103,6 +103,46 @@ def test_encode_graph_sequence_shape() -> None:
     assert not pad.any()
 
 
+def test_causal_encoder_ignores_future_frames_at_early_timestep() -> None:
+    """Frame 0 representation must not change when only a future timestep is edited."""
+    enc = PickAndRollTemporalEncoder(
+        embed_dim=GRAPH_FEATURE_DIM,
+        num_heads=3,
+        num_layers=1,
+        dim_feedforward=128,
+        causal=True,
+    )
+    enc.eval()
+    seq_len = 8
+    base = torch.zeros(1, seq_len, GRAPH_FEATURE_DIM)
+    with torch.no_grad():
+        out_base = enc(base)[0, 0, :].clone()
+        perturbed = base.clone()
+        perturbed[0, -1, :] = 50.0
+        out_perturbed = enc(perturbed)[0, 0, :]
+    assert torch.allclose(out_base, out_perturbed)
+
+
+def test_bidirectional_encoder_can_use_future_frames() -> None:
+    """With causal=False, frame 0 may change when only the last timestep is edited."""
+    enc = PickAndRollTemporalEncoder(
+        embed_dim=GRAPH_FEATURE_DIM,
+        num_heads=3,
+        num_layers=1,
+        dim_feedforward=128,
+        causal=False,
+    )
+    enc.eval()
+    seq_len = 8
+    base = torch.zeros(1, seq_len, GRAPH_FEATURE_DIM)
+    with torch.no_grad():
+        out_base = enc(base)[0, 0, :]
+        perturbed = base.clone()
+        perturbed[0, -1, :] = 50.0
+        out_perturbed = enc(perturbed)[0, 0, :]
+    assert not torch.allclose(out_base, out_perturbed)
+
+
 def test_encode_graph_sequence_marks_invalid_frames() -> None:
     """Invalid GraphFrame positions are True in src_key_padding_mask."""
     zero_nodes = np.zeros((3, NODE_DIM), dtype=np.float32)
