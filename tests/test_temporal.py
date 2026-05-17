@@ -13,6 +13,7 @@ import torch
 
 from rfdetr.graph import EDGE_DIM, GRAPH_FEATURE_DIM, GraphFrame, NODE_DIM
 from rfdetr.temporal import (
+    PickAndRollLinearClassifier,
     PickAndRollTemporalClassifier,
     PickAndRollTemporalEncoder,
     SinusoidalPositionEncoding,
@@ -55,6 +56,27 @@ def test_temporal_encoder_padding_mask_runs() -> None:
     z = enc(x, src_key_padding_mask=mask)
     assert z.shape == (1, 8, GRAPH_FEATURE_DIM)
     assert torch.isfinite(z).all()
+
+
+def test_linear_classifier_frame_level_logit_shape() -> None:
+    """Linear baseline outputs one logit per frame (B, T) without cross-frame mixing."""
+    clf = PickAndRollLinearClassifier(embed_dim=GRAPH_FEATURE_DIM, frame_level=True)
+    x = torch.randn(4, 8, GRAPH_FEATURE_DIM)
+    logits = clf(x)
+    assert logits.shape == (4, 8)
+
+
+def test_linear_classifier_ignores_future_in_single_forward() -> None:
+    """Editing later frames does not change logits at frame 0 (no temporal module)."""
+    clf = PickAndRollLinearClassifier(embed_dim=GRAPH_FEATURE_DIM, frame_level=True)
+    clf.eval()
+    base = torch.zeros(1, 6, GRAPH_FEATURE_DIM)
+    with torch.no_grad():
+        out0 = clf(base)[0, 0].clone()
+        perturbed = base.clone()
+        perturbed[0, -1, :] = 100.0
+        out0_perturbed = clf(perturbed)[0, 0]
+    assert torch.allclose(out0, out0_perturbed)
 
 
 def test_temporal_classifier_frame_level_logit_shape() -> None:

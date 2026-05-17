@@ -12,7 +12,7 @@ cd "$REPO_ROOT"
 DATA_DIR="${DATA_DIR:-raw_data_4}"
 
 # Val clips (comma-separated, no spaces). Override: VAL_CLIPS="Dame2,ChrisPaul7,..."
-VAL_CLIPS="${VAL_CLIPS:-Dame2,ChrisPaul7,Harden6,Curry3,TyreseMaxey2}"
+VAL_CLIPS="${VAL_CLIPS:-Dame2,ChrisPaul7,Harden6,Curry3,TyreseMaxey2,JalenBrown3}"
 
 export PYTHONPATH="${PYTHONPATH:-src}"
 

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 __all__ = [
     "encode_graph_sequence",
+    "PickAndRollLinearClassifier",
     "PickAndRollTemporalEncoder",
     "PickAndRollTemporalClassifier",
     "SinusoidalPositionEncoding",
@@ -242,6 +243,59 @@ class PickAndRollTemporalClassifier(nn.Module):
         # Clip-level: masked mean pool then scalar
         if src_key_padding_mask is not None:
             valid = (~src_key_padding_mask).to(dtype=h.dtype)            # (B, T)
+            summed = (logits * valid).sum(dim=1)
+            denom = valid.sum(dim=1).clamp(min=1e-6)
+            return summed / denom
+        return logits.mean(dim=1)
+
+
+class PickAndRollLinearClassifier(nn.Module):
+    """Per-frame linear classifier on graph features (no cross-frame attention).
+
+    Baseline for comparing against :class:`PickAndRollTemporalClassifier`.
+    Each timestep is scored independently from ``x[:, t, :]``; ``src_key_padding_mask``
+    is only used for clip-level pooling when ``frame_level=False``.
+
+    Args:
+        embed_dim: Input feature size per frame (default ``GRAPH_FEATURE_DIM``).
+        frame_level: If ``True`` (default), return ``(B, T)`` logits.  If ``False``,
+            masked mean over time → ``(B,)``.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = GRAPH_FEATURE_DIM,
+        frame_level: bool = True,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.head = nn.Linear(embed_dim, 1)
+        self.frame_level = frame_level
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return per-frame or clip-level logits.
+
+        Args:
+            x: ``(B, T, embed_dim)``.
+            src_key_padding_mask: Optional ``(B, T)`` bool mask; ``True`` marks
+                frames to ignore (clip-level pooling only).
+
+        Returns:
+            ``(B, T)`` when ``frame_level=True``, else ``(B,)``.
+        """
+        if x.dim() != 3:
+            raise ValueError(f"expected x shape (B, T, D), got {tuple(x.shape)}")
+        if x.size(-1) != self.embed_dim:
+            raise ValueError(f"expected last dim {self.embed_dim}, got {x.size(-1)}")
+        logits = self.head(x).squeeze(-1)
+        if self.frame_level:
+            return logits
+        if src_key_padding_mask is not None:
+            valid = (~src_key_padding_mask).to(dtype=x.dtype)
             summed = (logits * valid).sum(dim=1)
             denom = valid.sum(dim=1).clamp(min=1e-6)
             return summed / denom

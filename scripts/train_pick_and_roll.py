@@ -75,7 +75,11 @@ import torch.nn as nn
 
 from rfdetr.graph import GRAPH_FEATURE_DIM
 from rfdetr.graph_normalization import GraphFeatureNormalization, standardize
-from rfdetr.temporal import PickAndRollTemporalClassifier, PickAndRollTemporalEncoder
+from rfdetr.temporal import (
+    PickAndRollLinearClassifier,
+    PickAndRollTemporalClassifier,
+    PickAndRollTemporalEncoder,
+)
 
 SEGMENT_TV_WEIGHT = 0
 
@@ -282,6 +286,13 @@ def main() -> None:
         metavar="PATH",
         help="Optional path to save final model checkpoint (.pt).",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=("transformer", "linear"),
+        default="transformer",
+        help="transformer: causal temporal encoder (default). linear: per-frame linear baseline.",
+    )
     args = parser.parse_args()
 
     if not args.smoke_test and args.labels is None:
@@ -332,19 +343,26 @@ def main() -> None:
         sys.exit(1)
     print(f"Training on {len(labeled_clips)} clip(s) with at least one labeled frame.")
 
-    model = PickAndRollTemporalClassifier(
-        encoder=PickAndRollTemporalEncoder(
+    if args.model == "linear":
+        model = PickAndRollLinearClassifier(
             embed_dim=GRAPH_FEATURE_DIM,
-            num_heads=3,
-            num_layers=2,
-            dim_feedforward=128,
-            dropout=0.1,
-            causal=True,
-        ),
-        frame_level=True,
-    ).to(device)
+            frame_level=True,
+        ).to(device)
+        print("Using linear per-frame baseline (no temporal encoder).")
+    else:
+        model = PickAndRollTemporalClassifier(
+            encoder=PickAndRollTemporalEncoder(
+                embed_dim=GRAPH_FEATURE_DIM,
+                num_heads=3,
+                num_layers=2,
+                dim_feedforward=128,
+                dropout=0.1,
+                causal=True,
+            ),
+            frame_level=True,
+        ).to(device)
+        print("Using causal temporal attention (no future-frame lookahead).")
     model.train()
-    print("Using causal temporal attention (no future-frame lookahead).")
 
     # Weight positives higher to reduce "always negative" collapse.
     # pos_weight ~= N_neg / N_pos over labeled training frames.
@@ -566,6 +584,7 @@ def main() -> None:
         args.save_model.parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
             "model_state_dict": model.state_dict(),
+            "model_type": args.model,
             "embed_dim": GRAPH_FEATURE_DIM,
             "num_heads": 3,
             "num_layers": 2,
