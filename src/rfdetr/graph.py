@@ -30,12 +30,13 @@ Where:
   captures movement direction independent of speed magnitude so that a
   play running left vs right produces the same directional pattern.
 
-Edge features (``EDGE_DIM = 9``, one row per directed edge A→B)::
+Edge features (``EDGE_DIM = 13``, one row per directed edge A→B)::
 
     [dx_norm, dy_norm, dvx_norm, dvy_norm, dist_norm, approach_rate,
-     speed_ratio, blocker_score, screen_angle_cos]
+     speed_ratio, blocker_score, screen_angle_cos,
+     delta_speed_s, delta_speed_bh, delta_speed_d, closing_bh_s]
 
-Where:
+Where (last four are frame-level scalars repeated on every edge):
 
 * ``approach_rate = dot(v_A_norm, unit(A→B))`` captures whether A is
   actively moving *toward* B (positive) or away (negative) — the key signal
@@ -52,6 +53,13 @@ Where:
   BH's own velocity heading.  Near 1 means the ball-handler is running
   directly toward the screen; near −1 means running away.  Identical for all
   six edges.
+* ``delta_speed_*`` — change in speed vs the previous **valid** frame, when
+  the same ``tracker_id`` still holds that role; else ``0``.  Normalised by
+  ``max_speed``, clipped to ``[-1, 1]``.  Highlights screener **motion onset**
+  (end of planted screen) and BH/D acceleration.
+* ``closing_bh_s`` — ``clip((prev_dist(BH,S) - dist(BH,S)) / max_speed, -1, 1)``
+  using pixel distance between BH and S centres; positive when BH and S are
+  **getting closer** (approaching the screen).
 
 Example::
 
@@ -87,7 +95,7 @@ import supervision as sv
 # Number of features per node and per directed edge — exposed so downstream
 # modules can derive their input dimensions without hard-coding magic numbers.
 NODE_DIM: int = 11
-EDGE_DIM: int = 9
+EDGE_DIM: int = 13
 _NUM_NODES: int = 3
 _NUM_EDGES: int = 6  # complete directed graph: 3 nodes × 2 directions
 # Flattened ``GraphFrame``: ``3 * NODE_DIM + 6 * EDGE_DIM`` (node rows + edge rows).
@@ -165,11 +173,44 @@ class PickAndRollGraphBuilder:
         self.max_speed = max_speed
         self._last_bh_tracker_id: int | None = None
         self._last_bh_centre: np.ndarray | None = None
+        # Temporal speed / distance (last valid frame), for delta features.
+        self._prev_speed_bh: float | None = None
+        self._prev_speed_s: float | None = None
+        self._prev_speed_d: float | None = None
+        self._prev_dist_bh_s: float | None = None
+        self._prev_tid_bh: int | None = None
+        self._prev_tid_s: int | None = None
+        self._prev_tid_d: int | None = None
 
     def reset(self) -> None:
         """Clear ball-handler memory when switching to a new clip or game."""
         self._last_bh_tracker_id = None
         self._last_bh_centre = None
+        self._prev_speed_bh = None
+        self._prev_speed_s = None
+        self._prev_speed_d = None
+        self._prev_dist_bh_s = None
+        self._prev_tid_bh = None
+        self._prev_tid_s = None
+        self._prev_tid_d = None
+
+    @staticmethod
+    def _delta_speed_clipped(
+        curr_speed: float,
+        prev_speed: float | None,
+        curr_tid: int | None,
+        prev_tid: int | None,
+        max_speed: float,
+    ) -> float:
+        """Normalised speed change if same tracker; else 0."""
+        if (
+            prev_speed is None
+            or curr_tid is None
+            or prev_tid is None
+            or curr_tid != prev_tid
+        ):
+            return 0.0
+        return float(np.clip((curr_speed - prev_speed) / max_speed, -1.0, 1.0))
 
     def _ball_handler_idx_without_ball(
         self,
@@ -285,6 +326,38 @@ class PickAndRollGraphBuilder:
         bh_heading = p_vel[bh_idx] / (float(p_speed[bh_idx]) + 1e-6)
         screen_angle_cos = float(np.clip(np.dot(bh_heading, bs_unit), -1.0, 1.0))
 
+        dist_bh_s_pix = float(np.linalg.norm(s_c - bh_c))
+        tid_bh = int(tid_player[bh_idx]) if tid_player is not None else None
+        tid_s = int(tid_player[screener_idx]) if tid_player is not None else None
+        tid_d = int(tid_player[defender_idx]) if tid_player is not None else None
+        spd_bh = float(p_speed[bh_idx])
+        spd_s = float(p_speed[screener_idx])
+        spd_d = float(p_speed[defender_idx])
+
+        delta_speed_s = PickAndRollGraphBuilder._delta_speed_clipped(
+            spd_s, self._prev_speed_s, tid_s, self._prev_tid_s, self.max_speed
+        )
+        delta_speed_bh = PickAndRollGraphBuilder._delta_speed_clipped(
+            spd_bh, self._prev_speed_bh, tid_bh, self._prev_tid_bh, self.max_speed
+        )
+        delta_speed_d = PickAndRollGraphBuilder._delta_speed_clipped(
+            spd_d, self._prev_speed_d, tid_d, self._prev_tid_d, self.max_speed
+        )
+
+        closing_bh_s = 0.0
+        if (
+            self._prev_dist_bh_s is not None
+            and tid_bh is not None
+            and tid_s is not None
+            and self._prev_tid_bh is not None
+            and self._prev_tid_s is not None
+            and tid_bh == self._prev_tid_bh
+            and tid_s == self._prev_tid_s
+        ):
+            closing_bh_s = float(
+                np.clip((self._prev_dist_bh_s - dist_bh_s_pix) / self.max_speed, -1.0, 1.0)
+            )
+
         # ── Node features ─────────────────────────────────────────────────
         bh_cx = cx[bh_idx]
         bh_cy = cy[bh_idx]
@@ -325,8 +398,29 @@ class PickAndRollGraphBuilder:
             # Speed ratio: >1 means A is faster than B (screener planted if <1 on S→BH edge).
             speed_ratio = float(np.clip(p_speed[ra] / (p_speed[rb] + 1e-6), 0.0, 10.0) / 10.0)
 
-            # New: frame-level scalars appended to every edge.
-            edge_feats[e] = [dx, dy, dvx, dvy, dist, approach_rate, speed_ratio,
-                             blocker_score, screen_angle_cos]
+            # Frame-level scalars repeated on every edge.
+            edge_feats[e] = [
+                dx,
+                dy,
+                dvx,
+                dvy,
+                dist,
+                approach_rate,
+                speed_ratio,
+                blocker_score,
+                screen_angle_cos,
+                delta_speed_s,
+                delta_speed_bh,
+                delta_speed_d,
+                closing_bh_s,
+            ]
+
+        self._prev_speed_bh = spd_bh
+        self._prev_speed_s = spd_s
+        self._prev_speed_d = spd_d
+        self._prev_dist_bh_s = dist_bh_s_pix
+        self._prev_tid_bh = tid_bh
+        self._prev_tid_s = tid_s
+        self._prev_tid_d = tid_d
 
         return GraphFrame(node_features=node_feats, edge_features=edge_feats, valid=True)
